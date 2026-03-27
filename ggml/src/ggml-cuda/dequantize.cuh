@@ -102,6 +102,26 @@ static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, cons
 
 #define QR_TURBO3 2
 
+static const __device__ float TURBO2_CENTROIDS_D[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+
+static __device__ __forceinline__ void dequantize_turbo2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo2_0 * x = (const block_turbo2_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+
+    const int j0 = iqs * 2;
+    const int j1 = iqs * 2 + 1;
+
+    uint8_t idx0 = (x[ib].qs[j0 >> 2] >> ((j0 & 3) << 1)) & 0x3;
+    uint8_t idx1 = (x[ib].qs[j1 >> 2] >> ((j1 & 3) << 1)) & 0x3;
+
+    v.x = TURBO2_CENTROIDS_D[idx0] * norm;
+    v.y = TURBO2_CENTROIDS_D[idx1] * norm;
+}
+
+#define QR_TURBO2 2
+
 static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
     const float norm = __half2float(x[ib].norm);

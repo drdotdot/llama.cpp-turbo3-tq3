@@ -2070,7 +2070,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] divisible by 128
     // No reshape/cont/matmul needed — the custom kernel handles groups internally
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
         if (q->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
             q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
@@ -2081,7 +2081,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation: O(d log d) inverse WHT on attention output
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
         if (cur->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse

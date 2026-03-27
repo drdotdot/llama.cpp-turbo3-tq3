@@ -323,6 +323,11 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
+    if (dst->type == GGML_TYPE_TURBO2_0) {
+        ggml_cuda_op_set_rows_turbo2(ctx, dst);
+        return;
+    }
+
     if (dst->type == GGML_TYPE_TURBO3_0) {
         ggml_cuda_op_set_rows_turbo3(ctx, dst);
         return;

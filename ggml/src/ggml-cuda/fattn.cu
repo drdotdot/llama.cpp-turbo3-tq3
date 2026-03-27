@@ -56,6 +56,37 @@ static __global__ void k_turbo3_dequant_rows_f16(
 }
 
 
+// Multi-row dequant for turbo2 — same structure as turbo3 but 4 centroids, 2-bit, no sign byte.
+static __global__ void k_turbo2_dequant_rows_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0,
+        const int64_t row_start, const int64_t n_rows,
+        const size_t  src_nb1,   const size_t  src_nb2,
+        const int64_t dst_row_stride, const int64_t dst_head_stride) {
+
+    const float C[4] = {
+        -0.133462f, -0.039994f, 0.039994f, 0.133462f
+    };
+
+    const int64_t local_row = blockIdx.x;
+    const int64_t head      = blockIdx.y;
+    const int j = threadIdx.x;
+    if (j >= ne0 || local_row >= n_rows) return;
+
+    const int64_t abs_row = row_start + local_row;
+
+    const char * src_row = src + head * src_nb2 + abs_row * src_nb1;
+    const int blk_idx  = j / QK_TURBO2;
+    const int j_in_blk = j % QK_TURBO2;
+    const block_turbo2_0 * blk = (const block_turbo2_0 *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+    const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+    const float val = C[idx] * norm;
+
+    dst[head * dst_head_stride + abs_row * dst_row_stride + j] = __float2half(val);
+}
+
 // Multi-row dequant for turbo4 — same structure as turbo3 but with QJL residual.
 static __global__ void k_turbo4_dequant_rows_f16(
         const char * __restrict__ src, half * __restrict__ dst,
@@ -148,6 +179,12 @@ static void turbo_shadow_sync(
         dim3 grid((int)n_rows, (int)ne2);
         if (T->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_rows_f16<<<grid, (int)ne0, 0, stream>>>(
+                (const char *)T->data, sh.buf, ne0,
+                row_start, n_rows,
+                T->nb[1], T->nb[2],
+                dst_row_stride, dst_head_stride);
+        } else if (T->type == GGML_TYPE_TURBO2_0) {
+            k_turbo2_dequant_rows_f16<<<grid, (int)ne0, 0, stream>>>(
                 (const char *)T->data, sh.buf, ne0,
                 row_start, n_rows,
                 T->nb[1], T->nb[2],
@@ -429,6 +466,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     // TurboQuant FA (always available)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
@@ -512,7 +550,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        const bool turbo_k_mixed = (K->type == GGML_TYPE_TURBO3_0 &&
+        const bool turbo_k_mixed = ((K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0) &&
             (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0));
         // Allow f16 K + q8_0 V (used by asymmetric turbo3 K shadow + q8_0 V)
         const bool f16_k_q8_v = (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0);
@@ -534,6 +572,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
             break;
@@ -548,7 +587,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // TurboQuant: only the vec kernel has turbo dequant support.
-    if (K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
+    if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
+        K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) {
         if (can_use_vector_kernel) {
             return BEST_FATTN_KERNEL_VEC;
@@ -662,8 +702,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool turbo_k = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
-    const bool turbo_v = (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0);
+    const bool turbo_k = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+    const bool turbo_v = (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0);
     const bool turbo_kv = turbo_k || turbo_v;
 
     // For non-turbo types, go straight to the normal dispatch.
