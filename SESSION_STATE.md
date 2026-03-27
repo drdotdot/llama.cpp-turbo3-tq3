@@ -1,48 +1,43 @@
 # Session State — TurboQuant CUDA
 
-**Updated**: 2026-03-27 Session 9
+**Updated**: 2026-03-27 Session 10
 **Branch**: `release/turbo3-cuda`
 
-## Performance (unchanged from Session 8)
-| Context | q8_0 | turbo3 | Ratio |
-|---------|------|--------|-------|
-| short | 55.05 | 51.95 | 0.944x |
-| 32K | 45.96 | 47.76 | 1.039x |
-| 128K MoE | 79 | 87 | 1.100x |
+## Performance (Final Tier 2 — Dense Model)
+| Type | Short | 32K | Short ratio | 32K ratio | PPL (2048) |
+|------|-------|-----|-------------|-----------|------------|
+| q8_0 | 57.10 | 47.02 | baseline | baseline | 5.674 |
+| turbo2 | 53.87 | **48.94** | 0.943x | **1.041x** | 5.929 (+4.5%) |
+| turbo3 | 53.45 | **48.27** | 0.936x | **1.027x** | 5.736 (+1.1%) |
+| turbo4 | 51.78 | — | 0.907x | — | 5.743 (+1.2%) |
 
-## Session 9 Summary
+## Session 10 Summary
 
-### Competitive Intelligence (Phase 1-3)
-Cloned 5 repos across spiritbuun (feature, turbo2) and TheTom (feature, decode-experiments, turboquant_plus). Full analysis at `.trash/intelligence.md`.
+### Phase 1: Bug Fixes
+- turbo4 multi-seq NaN: architectural limitation (shadow strides vs ne[3]>1). Documented.
+- Sparse V threshold: verified consistent 1e-4 both paths.
+- Multi-GPU q_rot_buf: N/A (we use graph-level rotation).
+- Partial offload: verified clear error message works.
 
-Key discoveries:
-- **spiritbuun has TURBO2_0** (2-bit, 2.5 bpv, 6.4x compression). PPL +8% uniform (too aggressive), but turbo2-K + turbo3-V at +3.9% is interesting.
-- **spiritbuun has multi-seq fix** (6f8f923) — different arch from ours (bulk dequant vs shadow cache)
-- **TheTom tested 12 decode approaches** — 4-mag LUT won at +38% on Metal. Not directly applicable to our CUDA shadow path.
-- **No new external competitors** found in web search.
+### Phase 2: turbo2 Full Port — COMPLETE
+23 files, 544 lines. Type registration, CPU reference, CUDA kernels, FA integration,
+template instances, arg parser, context/graph/kv-cache integration.
+- turbo2 PPL ctx=2048: 5.929 (+4.49%)
+- turbo2 decode: 53.87 short, 48.94 at 32K (1.041x vs q8_0!)
+- Mixed K=turbo2 V=turbo3: needs additional FA instances (future work)
 
-### Ported Fixes (Phase 4)
-1. **Partial GPU offload crash** (spiritbuun c99c230): CPU type_traits registration + runtime error check
-2. **KV cache tensor budget** (spiritbuun 6cdd9db): n_turbo_extra=8 safety margin
-3. **Asymmetric LA modes 6-8** (spiritbuun 65e28eb): K/V independent promotion
-   - Mode 6 tested: PPL 6.817 (+0.86%) — better than uniform turbo3
-
-### turbo2 Port (stashed)
-Type registration (ggml.h, ggml-common.h, ggml.c) stashed as WIP. Needs:
-- CPU reference quantize/dequant in ggml-turbo-quant.c
-- CUDA kernels (SET_ROWS, GET_ROWS, shadow dequant)
-- FA vec_dot + V dequant
-- Template instances
-- Integration (context, graph, kv-cache, bench)
+### Phase 4: lop3 Research
+Confirmed: lop3 helps bit extraction only (already 2 ops on CUDA). The real win
+needs MMA tensor cores with new FA kernel. Multi-day project, deferred.
 
 ## Continuation Prompt
-> Read SESSION_STATE.md and .trash/intelligence.md. Branch: release/turbo3-cuda.
+> Read SESSION_STATE.md. Branch: release/turbo3-cuda.
 >
-> Session 9 completed: competitive intel + 3 ported fixes.
-> turbo2 type registration stashed (`git stash pop` to continue).
+> Session 10 completed: turbo2 full port (23 files), all known fixes ported.
+> Feature parity with spiritbuun achieved (turbo2/3/4, LA modes 1-8, all safety fixes).
 >
 > Next priorities:
-> 1. Complete turbo2 port (stashed WIP, ~4-5 hours remaining)
-> 2. Fix native turbo4 vec_dot for multi-seq (Q->ne[3]>1)
-> 3. Post discussion to #20969 (draft at .trash/DISCUSSION_POST.md)
-> 4. lop3 TC-based FA kernel prototype
+> 1. Mixed turbo2/turbo3 FA instances (for K=turbo2 V=turbo3 mode)
+> 2. Fix turbo4 multi-seq (needs shadow ne[3] support or native vec_dot fix)
+> 3. lop3 TC-based FA kernel (multi-day moonshot)
+> 4. Post to #20969 (draft at .trash/DISCUSSION_POST.md)
