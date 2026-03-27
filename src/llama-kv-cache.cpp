@@ -46,12 +46,16 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    const bool is_turbo_type = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                                type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
+            const size_t n_turbo_extra = is_turbo_type ? 8 : 0; // rotation matrices + safety margin
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + n_turbo_extra)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -127,6 +131,18 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
+        // turbo3/turbo4 have no CPU vec_dot — crash if layer is on CPU.
+        if (ggml_backend_buft_is_host(buft)) {
+            const bool layer_has_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                                          type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
+            if (layer_has_turbo) {
+                throw std::runtime_error(
+                    "turbo3/turbo4 KV cache requires all layers on GPU. "
+                    "Layer " + std::to_string(il) + " is on CPU. "
+                    "Use -ngl 99 to offload all layers.");
+            }
+        }
+
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
@@ -138,7 +154,8 @@ llama_kv_cache::llama_kv_cache(
         // Layer-adaptive KV cache: promote quality-sensitive layers to q8_0.
         // TURBO_LAYER_ADAPTIVE env var: 0=uniform (default),
         //   1=q8_0 first4+last4, 2=q8_0 last8, 3=q8_0 last4,
-        //   4=q8_0 first4, 5=q8_0 first2+last2
+        //   4=q8_0 first4, 5=q8_0 first2+last2,
+        //   6=V-only q8_0 last8, 7=K-only q8_0 last8, 8=V-only q8_0 first2+last2
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -153,20 +170,27 @@ llama_kv_cache::llama_kv_cache(
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
                                    type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
             const uint32_t n_layer = hparams.n_layer;
-            bool promote = false;
+            bool promote_k = false;
+            bool promote_v = false;
             if (is_turbo && n_layer >= 8) {
                 switch (la_mode) {
-                    case 1: promote = (il < 4 || il >= n_layer - 4); break;
-                    case 2: promote = (il >= n_layer - 8); break;
-                    case 3: promote = (il >= n_layer - 4); break;
-                    case 4: promote = (il < 4); break;
-                    case 5: promote = (il < 2 || il >= n_layer - 2); break;
+                    case 1: promote_k = promote_v = (il < 4 || il >= n_layer - 4); break;
+                    case 2: promote_k = promote_v = (il >= n_layer - 8); break;
+                    case 3: promote_k = promote_v = (il >= n_layer - 4); break;
+                    case 4: promote_k = promote_v = (il < 4); break;
+                    case 5: promote_k = promote_v = (il < 2 || il >= n_layer - 2); break;
+                    case 6: promote_v = (il >= n_layer - 8); break;
+                    case 7: promote_k = (il >= n_layer - 8); break;
+                    case 8: promote_v = (il < 2 || il >= n_layer - 2); break;
                 }
             }
-            if (promote) {
+            if (promote_k) {
                 layer_type_k = GGML_TYPE_Q8_0;
+                LLAMA_LOG_INFO("%s: layer %d K promoted to q8_0 (LA mode %d)\n", __func__, il, la_mode);
+            }
+            if (promote_v) {
                 layer_type_v = GGML_TYPE_Q8_0;
-                LLAMA_LOG_INFO("%s: layer %d promoted to q8_0 (LA mode %d)\n", __func__, il, la_mode);
+                LLAMA_LOG_INFO("%s: layer %d V promoted to q8_0 (LA mode %d)\n", __func__, il, la_mode);
             }
         }
 
