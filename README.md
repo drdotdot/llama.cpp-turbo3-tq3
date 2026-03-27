@@ -127,11 +127,14 @@ Flash Attention is **required** for turbo types (auto-enabled when turbo K/V is 
 | Mode | Strategy | PPL impact |
 |------|----------|------------|
 | `0` | Uniform turbo3 (default) | +1.32% |
-| `1` | q8_0 for first 4 + last 4 layers | **+0.67%** (recommended) |
-| `2` | q8_0 for last 8 layers | ~+0.9% |
-| `3` | q8_0 for last 4 layers | ~+1.0% |
-| `4` | q8_0 for first 4 layers | ~+1.0% |
-| `5` | q8_0 for first 2 + last 2 layers | ~+0.9% |
+| `1` | q8_0 for first 4 + last 4 layers (K+V) | **+0.67%** (recommended) |
+| `2` | q8_0 for last 8 layers (K+V) | ~+0.9% |
+| `3` | q8_0 for last 4 layers (K+V) | ~+1.0% |
+| `4` | q8_0 for first 4 layers (K+V) | ~+1.0% |
+| `5` | q8_0 for first 2 + last 2 layers (K+V) | ~+0.9% |
+| `6` | **V-only** q8_0 for last 8 layers | +0.86% (saves more VRAM than mode 2) |
+| `7` | **K-only** q8_0 for last 8 layers | experimental |
+| `8` | **V-only** q8_0 for first 2 + last 2 | experimental |
 
 ## How It Works
 
