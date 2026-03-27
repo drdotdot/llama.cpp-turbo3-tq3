@@ -22,6 +22,7 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 | **Best speed at long context** | turbo3+turbo3 | `-ctk turbo3 -ctv turbo3` | Both K and V compressed. Beats q8_0 at 16K+. Sparse V skip at long ctx. |
 | **Best quality** | K=turbo3, V=q8_0 | `-ctk turbo3 -ctv q8_0` | Only K compressed, V stays full precision. Half the PPL delta. **Better than q8_0 quality at ctx=2048.** |
 | **Max VRAM savings** | turbo3 + layer-adaptive | `-ctk turbo3 -ctv turbo3` + `TURBO_LAYER_ADAPTIVE=1` | turbo3 everywhere except quality-sensitive layers (first+last 4) promoted to q8_0. PPL gap drops to +0.67%. |
+| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% — use when VRAM is critical. |
 | **Experimental** | turbo4 | `-ctk turbo4 -ctv turbo4` | 4.25 bpv with QJL residual correction. Similar speed to turbo3 through shadow path. |
 
 ## Headline Results (RTX 5090)
