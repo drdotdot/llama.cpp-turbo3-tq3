@@ -377,6 +377,30 @@ static __constant__ float d_turbo_wht_signs2[128] = {
     -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
 };
 
+// V-specific FWHT signs: independent rotation for value tensors.
+// Generated from seed=12345 (K signs use seed=42). Truly independent rotation.
+static __constant__ float d_turbo_wht_signs1_v[128] = {
+     1,-1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1,
+     1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1,
+    -1, 1,-1, 1,-1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1, 1,
+     1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1, 1, 1,-1,-1,-1,
+     1,-1, 1,-1,-1, 1,-1,-1, 1,-1,-1, 1, 1, 1,-1, 1,
+    -1,-1,-1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1,-1,-1,-1,
+     1,-1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1, 1, 1,-1, 1,
+    -1,-1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1, 1, 1,-1
+};
+
+static __constant__ float d_turbo_wht_signs2_v[128] = {
+    -1, 1, 1,-1, 1,-1,-1,-1, 1,-1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1,-1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1,
+     1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,
+    -1,-1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1, 1,-1,-1,
+    -1, 1,-1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,
+    -1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1, 1,
+     1, 1,-1, 1,-1,-1, 1,-1,-1,-1,-1,-1, 1,-1,-1, 1,
+     1, 1,-1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1,-1,-1, 1
+};
+
 __launch_bounds__(256, 1)
 static __global__ void kernel_turbo_wht(
     const float * __restrict__ src,
@@ -393,8 +417,10 @@ static __global__ void kernel_turbo_wht(
 
     float x[128];
 
-    const float * s_first  = (direction == 0) ? d_turbo_wht_signs1 : d_turbo_wht_signs2;
-    const float * s_second = (direction == 0) ? d_turbo_wht_signs2 : d_turbo_wht_signs1;
+    // direction 0: forward rotation for Q (uses K signs: signs1 → signs2)
+    // direction 1: inverse rotation for V output (uses V signs: signs2_v → signs1_v)
+    const float * s_first  = (direction == 0) ? d_turbo_wht_signs1   : d_turbo_wht_signs2_v;
+    const float * s_second = (direction == 0) ? d_turbo_wht_signs2   : d_turbo_wht_signs1_v;
 
     for (int i = 0; i < 128; i++) {
         x[i] = in[i] * s_first[i];
@@ -437,8 +463,11 @@ static __global__ void kernel_set_rows_turbo3(
     const int64_t ne01,
     const int64_t nb01,
     const int64_t nb1,
-    const int n_groups_per_row
+    const int n_groups_per_row,
+    const int use_v_signs
 ) {
+    const float * wht_signs1 = use_v_signs ? d_turbo_wht_signs1_v : d_turbo_wht_signs1;
+    const float * wht_signs2 = use_v_signs ? d_turbo_wht_signs2_v : d_turbo_wht_signs2;
     const int64_t row = blockIdx.x;
     if (row >= ne01) return;
 
@@ -461,8 +490,7 @@ static __global__ void kernel_set_rows_turbo3(
     float x[128];
     for (int i = 0; i < 128; i++) x[i] = grp_src[i] * inv_norm;
 
-    // Apply signs1
-    for (int i = 0; i < 128; i++) x[i] *= d_turbo_wht_signs1[i];
+    for (int i = 0; i < 128; i++) x[i] *= wht_signs1[i];
 
     // FWHT butterfly (7 stages for 128 elements)
     for (int h = 1; h < 128; h *= 2) {
@@ -477,7 +505,7 @@ static __global__ void kernel_set_rows_turbo3(
 
     // Normalize and apply signs2
     const float inv_sqrt_128 = 0.08838834764831845f;
-    for (int i = 0; i < 128; i++) x[i] = x[i] * inv_sqrt_128 * d_turbo_wht_signs2[i];
+    for (int i = 0; i < 128; i++) x[i] = x[i] * inv_sqrt_128 * wht_signs2[i];
 
     // Step 3: Quantize into 4 blocks of 32, accumulating reconstruction norm
     float recon_norm_sq = 0.0f;
@@ -525,6 +553,13 @@ static __global__ void kernel_set_rows_turbo3(
     }
 }
 
+// Detect whether a tensor is a V cache (name contains "cache_v")
+static bool turbo_is_v_tensor(const ggml_tensor * t) {
+    // Check view_src name if this is a view, otherwise check tensor name
+    const ggml_tensor * src = t->view_src ? t->view_src : t;
+    return src->name[0] != '\0' && strstr(src->name, "cache_v") != nullptr;
+}
+
 void ggml_cuda_op_set_rows_turbo3(
     ggml_backend_cuda_context & ctx,
     ggml_tensor * dst
@@ -550,8 +585,10 @@ void ggml_cuda_op_set_rows_turbo3(
     dim3 grid(ne01, grp_blocks);
     dim3 block(threads);
 
+    const int is_v = turbo_is_v_tensor(dst) ? 1 : 0;
+
     kernel_set_rows_turbo3<<<grid, block, 0, ctx.stream()>>>(
-        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row);
+        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row, is_v);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -579,8 +616,11 @@ static __global__ void kernel_set_rows_turbo4(
     block_turbo4_0 * __restrict__ dst,
     const int64_t ne00, const int64_t ne01,
     const int64_t nb01, const int64_t nb1,
-    const int n_groups_per_row
+    const int n_groups_per_row,
+    const int use_v_signs
 ) {
+    const float * wht_signs1 = use_v_signs ? d_turbo_wht_signs1_v : d_turbo_wht_signs1;
+    const float * wht_signs2 = use_v_signs ? d_turbo_wht_signs2_v : d_turbo_wht_signs2;
     const int64_t row = blockIdx.x;
     if (row >= ne01) return;
     const int grp_idx = blockIdx.y * blockDim.x + threadIdx.x;
@@ -600,10 +640,10 @@ static __global__ void kernel_set_rows_turbo4(
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = grp_src[j] * inv_norm;
 
-    // Forward FWHT rotation
-    for (int i = 0; i < 128; i++) x[i] *= d_turbo_wht_signs1[i];
+    // Forward FWHT rotation (K or V specific signs)
+    for (int i = 0; i < 128; i++) x[i] *= wht_signs1[i];
     turbo_fwht_128(x);
-    for (int i = 0; i < 128; i++) x[i] *= d_turbo_wht_signs2[i];
+    for (int i = 0; i < 128; i++) x[i] *= wht_signs2[i];
 
     // 3-bit quantize
     for (int j = 0; j < 48; j++) dst_blk->qs[j] = 0;
@@ -682,8 +722,10 @@ void ggml_cuda_op_set_rows_turbo4(
     dim3 grid(ne01, grp_blocks);
     dim3 block(threads);
 
+    const int is_v = turbo_is_v_tensor(dst) ? 1 : 0;
+
     kernel_set_rows_turbo4<<<grid, block, 0, ctx.stream()>>>(
-        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row);
+        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row, is_v);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -702,8 +744,11 @@ static __global__ void kernel_set_rows_turbo2(
     const int64_t ne01,
     const int64_t nb01,
     const int64_t nb1,
-    const int n_groups_per_row
+    const int n_groups_per_row,
+    const int use_v_signs
 ) {
+    const float * wht_signs1 = use_v_signs ? d_turbo_wht_signs1_v : d_turbo_wht_signs1;
+    const float * wht_signs2 = use_v_signs ? d_turbo_wht_signs2_v : d_turbo_wht_signs2;
     const int64_t row = blockIdx.x;
     if (row >= ne01) return;
 
@@ -726,8 +771,7 @@ static __global__ void kernel_set_rows_turbo2(
     float x[128];
     for (int i = 0; i < 128; i++) x[i] = grp_src[i] * inv_norm;
 
-    // Apply signs1
-    for (int i = 0; i < 128; i++) x[i] *= d_turbo_wht_signs1[i];
+    for (int i = 0; i < 128; i++) x[i] *= wht_signs1[i];
 
     // FWHT butterfly (7 stages for 128 elements)
     for (int h = 1; h < 128; h *= 2) {
@@ -742,7 +786,7 @@ static __global__ void kernel_set_rows_turbo2(
 
     // Normalize and apply signs2
     const float inv_sqrt_128 = 0.08838834764831845f;
-    for (int i = 0; i < 128; i++) x[i] = x[i] * inv_sqrt_128 * d_turbo_wht_signs2[i];
+    for (int i = 0; i < 128; i++) x[i] = x[i] * inv_sqrt_128 * wht_signs2[i];
 
     // Step 3: Quantize into 4 blocks of 32, accumulating reconstruction norm
     float recon_norm_sq = 0.0f;
@@ -804,8 +848,10 @@ void ggml_cuda_op_set_rows_turbo2(
     dim3 grid(ne01, grp_blocks);
     dim3 block(threads);
 
+    const int is_v = turbo_is_v_tensor(dst) ? 1 : 0;
+
     kernel_set_rows_turbo2<<<grid, block, 0, ctx.stream()>>>(
-        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row);
+        src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row, is_v);
 }
 
 void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
