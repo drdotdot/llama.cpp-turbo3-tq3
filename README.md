@@ -61,7 +61,7 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 | turbo3 | 6.803 (+0.65%) | 5.737 (+1.11%) |
 | turbo3 LA-1 | 6.804 (+0.67%) | -- |
 | K=turbo3 V=q8_0 | 6.804 (+0.67%) | 5.650 (**-0.42%**) |
-| turbo4 | -- | 5.743 (+1.22%) |
+| turbo4 | -- | 5.715 (+0.72%) |
 
 ## Comparison With Other Forks
 
