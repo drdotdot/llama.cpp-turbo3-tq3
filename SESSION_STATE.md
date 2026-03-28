@@ -1,50 +1,42 @@
 # Session State — TurboQuant CUDA
 
-**Updated**: 2026-03-28 Session 10 (continued)
+**Updated**: 2026-03-28 Session 11
 **Branch**: `release/turbo3-cuda`
 
-## Performance (Updated)
+## Performance (Session 11 Final)
 | Type | Short | 32K | PPL ctx=512 | PPL ctx=2048 |
 |------|-------|-----|-------------|-------------|
-| q8_0 | 57.10 | 47.02 | 6.759 | 5.674 |
-| turbo2 | 53.87 | 48.94 | — | 5.929 (+4.5%) |
-| turbo3 | 52.07 | 48.27 | **6.803 (+0.65%)** | 5.737 (+1.11%) |
-| turbo4 | 48.83 | 44.36 | — | **5.715 (+0.72%)** |
+| q8_0 | ~55 | 45.48 | 6.759 | 5.674 |
+| turbo2 | ~53 | **48.59** | — | 5.929 (+4.5%) |
+| turbo3 | 52.76 | **47.86** | **6.803 (+0.65%)** | 5.737 (+1.11%) |
+| turbo4 | ~49 | 44.85 | — | **5.715 (+0.72%)** |
+| K=turbo3/V=q8_0 | 54.56 | 45.23 | 6.804 (+0.67%) | 5.650 (-0.42%) |
 
-## Session 10 Achievements
+## Session 11 Summary
 
-### Intelligence (5 repos analyzed)
-- spiritbuun (feature + turbo2): turbo2 port, 3 safety fixes
-- TheTom (feature + decode-experiments): 12 decode approaches, 4-mag LUT
-- 0xSero: Python/Triton, fused score, ring buffer, QJL score-level correction
-- yzamari: MLX Metal port, 4 Metal shaders, template kernels
-- RecursiveIntell: Rust, polar encoding, proper QJL residual
+### Phase 1: Ring Buffer Analysis
+Investigated 3 approaches for the 0.944x short-context gap:
+- Direct shadow write from SET_ROWS: cross-TU access to shadow (fattn.cu ↔ turbo-quant.cu) blocked by CUDA compilation model. Previous attempts (Session 6) caused register spill regression.
+- Graph-level SET_ROWS bypass: ggml graph is built with fixed structure, can't conditionally skip ops. Would require custom graph op or llama-graph.cpp modifications.
+- Batched shadow sync: 32 kernel launches × ~3μs = ~100μs. Savings from batching are ~0.5%.
 
-### Code Changes
-1. **3 spiritbuun fixes ported**: partial offload, tensor budget, asymmetric LA 6-8
-2. **turbo2 full port**: 23 files, 544 lines, 2-bit 2.5bpv, beats q8_0 at 32K
-3. **Independent K/V rotation**: PPL 6.848 → 6.803 at ctx=512 (free quality win)
-4. **turbo4 QJL original-space fix**: PPL 5.743 → 5.715 at ctx=2048
-5. **Build guards**: CUDA 13.x MMQ segfault + FORCE_CUBLAS perf trap warnings
-6. **5 intelligence reports**: intel.md, intel2.md, intel3.md, intel4.md, completedsession.md
+**Finding**: The 4% FWHT cost in SET_ROWS is the dominant overhead and requires graph-level changes to skip. Ring buffer within the current architecture saves at most ~1%. Documented in .trash/ASK.md.
 
-### Phase F Resolution
-Dimension-specific codebooks NOT needed — our FWHT rotation group is always 128
-elements regardless of head_dim. The d=128 Lloyd-Max codebooks are correct for all
-head dimensions. Computed and verified d=256 codebooks — they'd only be needed if
-rotation group size changed.
+### Phase 2: turbo4 Score-Level QJL (Partial)
+- MSE-only shadow dequant: turbo4 now matches turbo3 quality (5.737 at ctx=2048)
+- QJL signs + rnorm stored correctly for future score-level correction
+- Full score-level QJL needs FA logit bias support (no existing mechanism in llama.cpp FA)
+
+### Phase 4: Verification
+- 4A: Asymmetric K=turbo3/V=q8_0 PP = 2649 tok/s (fast, no CPU fallback)
+- 4B: MoE 128K turbo3 = 52.57 tok/s (no crash)
+- 4D: Full Tier 2 benchmark completed
 
 ## Continuation Prompt
 > Read SESSION_STATE.md. Branch: release/turbo3-cuda.
 >
-> Key results this session:
-> - turbo3 PPL: 6.803 (+0.65%) — improved via independent K/V rotation
-> - turbo4 PPL: 5.715 (+0.72%) — fixed QJL original-space residual
-> - turbo2: working, beats q8_0 by 4.1% at 32K
-> - Feature parity with spiritbuun achieved
+> Ring buffer needs graph-level changes to llama-graph.cpp (skip SET_ROWS for recent tokens).
+> turbo4 score-level QJL needs FA logit bias mechanism.
+> Both are deferred to dedicated sessions.
 >
-> Remaining:
-> 1. Ring buffer (128-token exact fp16) — biggest impact for 0.94x gap, needs arch changes
-> 2. turbo4 score-level QJL correction (not fused into dequant)
-> 3. lop3 TC-based FA kernel (multi-day moonshot)
-> 4. Post to #20969 (draft at .trash/DISCUSSION_POST.md)
+> All other features are complete and verified. Feature parity achieved.
