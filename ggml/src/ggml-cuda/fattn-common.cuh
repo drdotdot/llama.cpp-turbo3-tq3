@@ -557,11 +557,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
          0.021460f,  0.065717f,  0.117832f,  0.190685f
     };
 
-    // Optimized turbo3 KQ dot product: process full 32-element blocks with
-    // bulk qs/signs loads and pre-multiplied centroid LUT.
-    //
-    // Thread mapping: each thread processes D/(2*nthreads) half2 pairs.
-    // For D=256, nthreads=8: 16 pairs = 32 elements = exactly 1 turbo3 block per thread.
+    // Fused turbo3 KQ dot product — reads packed blocks directly, no fp16 intermediate.
+    // Pre-multiplied 8-entry centroid*norm LUT cached per block, batch byte loads.
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -577,17 +574,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
         const int ib = elem0 / QK_TURBO3;
         const int j_start = elem0 % QK_TURBO3;
 
-        // Cache centroid*norm LUT once per block
         if (ib != prev_ib) {
             const float norm = __half2float(K_turbo[ib].norm);
 #pragma unroll
-            for (int c = 0; c < 8; c++) {
-                cn[c] = C[c] * norm;
-            }
+            for (int c = 0; c < 8; c++) cn[c] = C[c] * norm;
             prev_ib = ib;
         }
 
-        // Batch-load qs and signs bytes
         const uint8_t qs_lo = K_turbo[ib].qs[j_start / 4];
         const uint8_t qs_hi = K_turbo[ib].qs[j_start / 4 + 1];
         const uint8_t signs = K_turbo[ib].signs[j_start / 8];
@@ -627,9 +620,8 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
          0.021460f,  0.065717f,  0.117832f,  0.190685f
     };
 
-    // Cache norm per block to avoid repeated __half2float conversions
     int prev_blk = -1;
-    float cn[8];
+    float cn[8]; // centroid * norm cached per block
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
