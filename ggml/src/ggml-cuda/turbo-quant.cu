@@ -21,6 +21,9 @@
 #include "ggml-common.h"
 #include <cuda_fp16.h>
 
+// Lloyd-Max codebooks for d=128 rotation groups.
+// Since FWHT groups are always 128 elements regardless of head_dim,
+// these codebooks are correct for all head dimensions.
 static __constant__ float TURBO3_CENTROIDS_C[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
