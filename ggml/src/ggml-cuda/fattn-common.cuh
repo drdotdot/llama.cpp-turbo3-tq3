@@ -559,6 +559,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
 
     // Fused turbo3 KQ dot product — reads packed blocks directly, no fp16 intermediate.
     // Pre-multiplied 8-entry centroid*norm LUT cached per block, batch byte loads.
+    //
+    // The centroid lookup cn[idx] with dynamic 3-bit idx is the compute bottleneck.
+    // nvcc compiles this to predicated register moves (~4 instructions per lookup).
+    // This is inherently ~4x more ALU per element than q8_0's single val*scale multiply
+    // or fp16's native half2 fmadd. Matching fp16 performance requires lop3/MMA hardware.
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
