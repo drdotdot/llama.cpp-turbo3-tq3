@@ -58,7 +58,7 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 | Config | ctx=512 | ctx=2048 |
 |--------|---------|----------|
 | q8_0 | 6.759 | 5.674 |
-| turbo3 | 6.848 (+1.32%) | 5.736 (+1.08%) |
+| turbo3 | 6.803 (+0.65%) | 5.737 (+1.11%) |
 | turbo3 LA-1 | 6.804 (+0.67%) | -- |
 | K=turbo3 V=q8_0 | 6.804 (+0.67%) | 5.650 (**-0.42%**) |
 | turbo4 | -- | 5.743 (+1.22%) |
