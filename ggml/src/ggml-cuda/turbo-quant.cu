@@ -711,16 +711,15 @@ static __global__ void kernel_set_rows_turbo4(
         if (residual[j] >= 0.0f) dst_blk->signs[j / 8] |= (1 << (j % 8));
     }
 
-    // Norm correction with QJL component
-    float qjl_scale_unit = 1.2533141f / 128.0f * rnorm;
-    float recon_full_sq = 0.0f;
+    // Norm correction: MSE-only (centroid reconstruction norm, no QJL).
+    // QJL correction is applied at score level, not fused into dequanted values.
+    // The signs[] and rnorm fields store QJL data for future score-level correction.
+    float recon_norm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        float s = (dst_blk->signs[j / 8] & (1 << (j % 8))) ? qjl_scale_unit : -qjl_scale_unit;
-        float r = recon[j] + s;
-        recon_full_sq += r * r;
+        recon_norm_sq += recon[j] * recon[j];
     }
-    float recon_full_norm = sqrtf(recon_full_sq);
-    dst_blk->norm = __float2half((recon_full_norm > 1e-10f) ? norm / recon_full_norm : norm);
+    float recon_norm = sqrtf(recon_norm_sq);
+    dst_blk->norm = __float2half((recon_norm > 1e-10f) ? norm / recon_norm : norm);
 }
 
 void ggml_cuda_op_set_rows_turbo4(

@@ -112,8 +112,7 @@ static __global__ void k_turbo4_dequant_rows_f16(
     const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
 
     const float norm = __half2float(blk->norm);
-    const float rnorm = __half2float(blk->rnorm);
-    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
+    // MSE-only dequant: centroid * norm (QJL correction applied at score level, not here)
 
     int bit_offset = j_in_blk * 3;
     int byte_idx = bit_offset / 8;
@@ -122,8 +121,7 @@ static __global__ void k_turbo4_dequant_rows_f16(
     if (byte_idx + 1 < 48) raw |= (uint16_t)blk->qs[byte_idx + 1] << 8;
     uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
 
-    float s = (blk->signs[j_in_blk / 8] & (1 << (j_in_blk % 8))) ? 1.0f : -1.0f;
-    float val = (C[idx] + s * qjl_scale) * norm;
+    float val = C[idx] * norm;
 
     dst[head * dst_head_stride + abs_row * dst_row_stride + j] = __float2half(val);
 }
