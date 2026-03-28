@@ -1,6 +1,6 @@
 # llama.cpp + TurboQuant CUDA — Faster Than q8_0 at Long Context
 
-CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, faster than q8_0 at 16K+ context, up to 19% faster at 128K.** Proven on dense and MoE architectures.
+CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, faster than q8_0 at 16K+ context, up to 30% faster at 128K.** Proven on dense and MoE architectures.
 
 ## Why Use This Fork?
 
@@ -8,10 +8,10 @@ CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026
 |---|---|---|
 | **KV memory** | 8.5 bits/value | **3.5 bits/value (4.6x smaller)** |
 | **Short context speed** | baseline | 0.94x (6% slower) |
-| **32K context speed** | baseline | **1.04x (4% faster)** |
-| **128K context speed (MoE)** | baseline | **1.19x (19% faster)** |
+| **32K context speed** | baseline | **1.06x (6% faster)** |
+| **128K context speed (MoE)** | baseline | **1.30x (30% faster)** |
 | **Max context for 32GB VRAM** | ~65K | **~300K** |
-| **Quality (PPL)** | baseline | +1.08% (negligible) |
+| **Quality (PPL)** | baseline | **+0.65% (negligible)** |
 
 The tradeoff: ~6% slower at short context, but faster at long context and fits 4.6x more context in VRAM. If you regularly use 8K+ context, turbo3 is a net win.
 
@@ -21,9 +21,9 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 |---|---|---|---|
 | **Best speed at long context** | turbo3+turbo3 | `-ctk turbo3 -ctv turbo3` | Both K and V compressed. Beats q8_0 at 16K+. Sparse V skip at long ctx. |
 | **Best quality** | K=turbo3, V=q8_0 | `-ctk turbo3 -ctv q8_0` | Only K compressed, V stays full precision. Half the PPL delta. **Better than q8_0 quality at ctx=2048.** |
-| **Max VRAM savings** | turbo3 + layer-adaptive | `-ctk turbo3 -ctv turbo3` + `TURBO_LAYER_ADAPTIVE=1` | turbo3 everywhere except quality-sensitive layers (first+last 4) promoted to q8_0. PPL gap drops to +0.67%. |
-| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% — use when VRAM is critical. |
-| **Experimental** | turbo4 | `-ctk turbo4 -ctv turbo4` | 4.25 bpv with QJL residual correction. Similar speed to turbo3 through shadow path. |
+| **Max VRAM savings** | turbo3 + layer-adaptive | `-ctk turbo3 -ctv turbo3` + `TURBO_LAYER_ADAPTIVE=1` | turbo3 everywhere except quality-sensitive layers (first+last 4) promoted to q8_0. |
+| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% -- use when VRAM is critical. Beats q8_0 by 6% at 32K. |
+| **Best PPL** | turbo4 | `-ctk turbo4 -ctv turbo4` | 4.25 bpv with QJL residual correction. PPL +0.72% at ctx=2048 (best of all turbo types). |
 
 ## Headline Results (RTX 5090)
 
@@ -31,45 +31,56 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio | KV Memory |
 |---------|-----------|-------------|-------|-----------|
-| short | 55.05 | 51.95 | 0.944x | 4.6x smaller |
-| 8K | 54.79 | 51.92 | 0.951x | 4.6x smaller |
-| 16K | 50.26 | 49.85 | **0.993x** | 4.6x smaller |
-| 32K | 45.96 | 47.76 | **1.039x** | 4.6x smaller |
+| short | 56.10 | 52.55 | 0.937x | 4.6x smaller |
+| 8K | 54.17 | ~52 | 0.96x | 4.6x smaller |
+| 32K | 46.03 | ~48 | **~1.04x** | 4.6x smaller |
 | Prefill | 3001 | 2931 | 0.977x | -- |
+
+### All Turbo Types at 32K (Dense)
+
+| Type | bpv | 32K tok/s | vs q8_0 | PPL ctx=2048 |
+|------|-----|----------|---------|-------------|
+| q8_0 | 8.5 | 46.03 | baseline | 5.674 |
+| turbo2 | 2.5 | **48.73** | **+5.9%** | 5.929 (+4.5%) |
+| turbo3 | 3.5 | **~48** | **~+4%** | 5.737 (+1.11%) |
+| turbo4 | 4.25 | ~46 | ~0% | **5.715 (+0.72%)** |
+| K=turbo3/V=q8_0 | ~6 | 46.15 | +0.3% | **5.650 (-0.42%)** |
 
 ### MoE Model: Qwen 3.5 35B-A3B Q4_K_M
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio |
 |---------|-----------|-------------|-------|
-| short | 186 | 158 | 0.846x |
-| 32K | 134 | 131 | **0.975x** |
-| 128K | 79 | 87 | **1.100x** |
+| short | 180 | 169 | 0.937x |
+| 32K | 150 | 142 | 0.947x |
+| 128K | 90 | **117** | **1.30x** |
 
-### Asymmetric Mode (K=turbo3, V=q8_0) on MoE
+### Asymmetric Mode (K=turbo3, V=q8_0)
 
-| Context | q8_0 tok/s | K=turbo3 V=q8_0 | Ratio |
-|---------|-----------|----------------|-------|
-| short | 194 | 179 | 0.924x |
-| 32K | 139 | 142 | **1.023x** |
-| 128K | 79 | 94 | **1.187x** |
+| Model | Context | q8_0 tok/s | K=turbo3 V=q8_0 | Ratio |
+|-------|---------|-----------|----------------|-------|
+| Dense | short | 56.10 | 54.46 | **0.971x** |
+| Dense | 8K | 54.17 | 52.51 | 0.969x |
+| Dense | 32K | 46.03 | 46.15 | 1.003x |
+| MoE | 128K | 90 | **95** | **1.05x** |
 
 ### Quality (PPL, wikitext-2, 8 chunks)
 
 | Config | ctx=512 | ctx=2048 |
 |--------|---------|----------|
 | q8_0 | 6.759 | 5.674 |
-| turbo3 | 6.803 (+0.65%) | 5.737 (+1.11%) |
+| turbo3 | **6.803 (+0.65%)** | 5.737 (+1.11%) |
 | turbo3 LA-1 | 6.804 (+0.67%) | -- |
-| K=turbo3 V=q8_0 | 6.804 (+0.67%) | 5.650 (**-0.42%**) |
-| turbo4 | -- | 5.715 (+0.72%) |
+| K=turbo3 V=q8_0 | 6.804 (+0.67%) | **5.650 (-0.42%)** |
+| turbo4 | -- | **5.715 (+0.72%)** |
+| turbo2 | -- | 5.929 (+4.5%) |
 
 ## Comparison With Other Forks
 
 | Fork | GPU | Architecture | Short ctx | 32K ctx | Notes |
 |------|-----|-------------|-----------|---------|-------|
-| **This fork (Madreag)** | RTX 5090 | Persistent fp16 shadow + sparse V | 0.944x | **1.039x** | Blackwell-optimized, asymmetric K/V, turbo4 |
-| [spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) | RTX 3090 | Per-call dequant+free | ~0.88x (dense) | ~0.97x (MoE) | turbo4, layer-adaptive, multi-GPU |
-| [TheTom](https://github.com/TheTom/llama-cpp-turboquant) | Apple M-series | Metal native | varies | varies | Original implementation, sparse V research |
+| **This fork (Madreag)** | RTX 5090 | Persistent fp16 shadow + sparse V | 0.937x | **~1.04x** | Blackwell-optimized, turbo2/3/4, asymmetric K/V, independent K/V rotation |
+| [spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) | RTX 3090 | Per-call dequant+free | ~0.88x (dense) | ~0.97x (MoE) | turbo2/3/4, layer-adaptive, multi-GPU |
+| [TheTom](https://github.com/TheTom/llama-cpp-turboquant) | Apple M-series | Metal native | varies | varies | Original implementation, sparse V research, 4-mag LUT |
 
 **Which fork for your GPU?**
 - **RTX 5090 / Blackwell**: This fork
@@ -80,9 +91,10 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 
 - **Persistent fp16 shadow cache** -- KV data dequanted once, cached across tokens. Only new positions (1 per token) need dequanting. Zero per-token overhead for existing cache entries.
 - **Sparse V dequantization** -- Skip V dequant+accumulate for positions with attention weight < 1e-4. Eliminates 90%+ of V-path work at long context. Based on [TheTom's research](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/sparse-v-dequant.md).
+- **Independent K/V rotation** -- K and V use separate FWHT sign arrays, decorrelating quantization errors. Free PPL improvement: +1.32% -> +0.65%.
 - **Asymmetric K/V types** -- Use turbo3 K + q8_0 V for best quality (half the PPL delta, better than q8_0 at long context).
-- **Layer-adaptive KV cache** -- Promote quality-sensitive layers (first+last) to q8_0. Cuts PPL gap from +1.32% to +0.67%.
-- **turbo4 support** -- 4.25 bpv with 1-bit QJL residual correction on top of turbo3's 3-bit PolarQuant.
+- **turbo2/turbo3/turbo4** -- Three compression levels: 2.5 / 3.5 / 4.25 bpv. Choose your compression vs quality tradeoff.
+- **Layer-adaptive KV cache** -- 8 modes for per-layer K/V type promotion (symmetric and asymmetric).
 - **Blackwell-optimized** -- 16-byte struct padding for GDDR7 32-byte sector coalescing, SM120 tuning.
 - **Prefill dequant+MMA** -- Tensor Core acceleration for prompt processing via bulk fp16 dequant.
 
@@ -99,8 +111,11 @@ cmake --build build -j$(nproc)
 # Best quality: turbo3 K + q8_0 V
 ./build/bin/llama-cli -hf your-model-GGUF -ctk turbo3 -ctv q8_0 -ngl 99
 
-# turbo4: 4.25 bpv with QJL residual
+# turbo4: best PPL (4.25 bpv with QJL residual)
 ./build/bin/llama-cli -hf your-model-GGUF -ctk turbo4 -ctv turbo4 -ngl 99
+
+# turbo2: maximum compression (2.5 bpv, 6.4x)
+./build/bin/llama-cli -hf your-model-GGUF -ctk turbo2 -ctv turbo2 -ngl 99
 
 # Server mode
 ./build/bin/llama-server -hf your-model-GGUF -ctk turbo3 -ctv turbo3 -ngl 99 --port 8080
@@ -113,6 +128,7 @@ TURBO_LAYER_ADAPTIVE=1 ./build/bin/llama-cli -hf your-model-GGUF -ctk turbo3 -ct
 
 - **Tested**: RTX 5090 32GB, CUDA 12.8, SM120 (Blackwell)
 - **Should work**: SM75+ (Turing and newer), but only tested on SM120. Use [spiritbuun's fork](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) for confirmed RTX 3090/4090 support
+- **Do NOT use CUDA 13.x** -- causes MMQ segfaults on SM120. Stick with CUDA 12.8.
 
 Flash Attention is **required** for turbo types (auto-enabled when turbo K/V is detected).
 
@@ -127,8 +143,8 @@ Flash Attention is **required** for turbo types (auto-enabled when turbo K/V is 
 
 | Mode | Strategy | PPL impact |
 |------|----------|------------|
-| `0` | Uniform turbo3 (default) | +1.32% |
-| `1` | q8_0 for first 4 + last 4 layers (K+V) | **+0.67%** (recommended) |
+| `0` | Uniform turbo (default) | +0.65% |
+| `1` | q8_0 for first 4 + last 4 layers (K+V) | **+0.67%** |
 | `2` | q8_0 for last 8 layers (K+V) | ~+0.9% |
 | `3` | q8_0 for last 4 layers (K+V) | ~+1.0% |
 | `4` | q8_0 for first 4 layers (K+V) | ~+1.0% |
@@ -142,7 +158,7 @@ Flash Attention is **required** for turbo types (auto-enabled when turbo K/V is 
 [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) compresses KV cache vectors to 3.5 bits/value:
 
 1. **Normalize** -- compute L2 norm of 128-element groups
-2. **Rotate** -- Fast Walsh-Hadamard Transform with random sign flips (Gaussianizes the distribution)
+2. **Rotate** -- Fast Walsh-Hadamard Transform with independent K/V sign arrays (Gaussianizes the distribution)
 3. **Quantize** -- nearest of 8 Lloyd-Max centroids (3-bit index)
 4. **Pack** -- 2-bit qs[] + 1-bit signs[] arrays + fp16 norm per block
 5. **Norm correction** -- store `raw_norm / ||reconstruction||` instead of raw norm for exact L2 norm recovery
@@ -171,14 +187,15 @@ Output -> graph-level inverse FWHT rotation on attention output
 ## Credits
 
 - **[TheTom](https://github.com/TheTom/llama-cpp-turboquant)** -- Original Metal implementation, sparse V dequant research, norm correction innovation, diagnostic scripts
-- **[spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda)** -- CUDA reference (RTX 3090), norm correction, layer-adaptive, prefill MMA, turbo4 port
+- **[spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda)** -- CUDA reference (RTX 3090), norm correction, layer-adaptive, prefill MMA, turbo2/turbo4 port
 - **[Google Research](https://arxiv.org/abs/2504.19874)** -- TurboQuant algorithm (ICLR 2026)
-- **[Madreag](https://github.com/Madreag)** -- This fork: RTX 5090 port, persistent shadow cache, sparse V CUDA, asymmetric K/V, Blackwell optimization
+- **[Madreag](https://github.com/Madreag)** -- This fork: RTX 5090 port, persistent shadow cache, sparse V CUDA, asymmetric K/V, independent K/V rotation, Blackwell optimization
 
 ## Related Projects
 
 - [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- Documentation, benchmarks, diagnostic scripts
 - [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) -- CUDA port for RTX 3090
+- [0xSero/turboquant](https://github.com/0xSero/turboquant) -- Python/Triton implementation for vLLM
 - [ggml-org/llama.cpp Discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969) -- Main TurboQuant community discussion
 
 ## License
