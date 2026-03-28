@@ -1,19 +1,19 @@
 # llama.cpp + TurboQuant CUDA — Faster Than q8_0 at Long Context
 
-CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, faster than q8_0 at 16K+ context, up to 31% faster at 128K.** Proven on dense and MoE architectures.
+CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, enabling 128K+ context on a single RTX 5090.** No fp16 shadow buffer — reads packed turbo blocks directly.
 
 ## Why Use This Fork?
 
 | | q8_0 (stock llama.cpp) | This fork (turbo3) |
 |---|---|---|
 | **KV memory** | 8.5 bits/value | **3.5 bits/value (4.6x smaller)** |
-| **Short context speed** | baseline | 0.95x (5% slower) |
-| **32K context speed (dense)** | baseline | **1.05x (5% faster)** |
-| **128K context speed (MoE)** | baseline | **1.31x (31% faster)** |
+| **Short context speed** | baseline | 0.90x (10% slower) |
+| **32K context speed** | baseline | 0.79x (compute-bound on centroid extraction) |
+| **128K context (dense 27B)** | OOM on 32GB | **Works at 25 GB VRAM** |
 | **Max context for 32GB VRAM** | ~65K | **~300K** |
 | **Quality (PPL)** | baseline | **+0.65% (negligible)** |
 
-The tradeoff: ~5% slower at short context, but faster at long context and fits 4.6x more context in VRAM. If you regularly use 8K+ context, turbo3 is a net win.
+The tradeoff: ~10-20% slower decode (centroid extraction overhead), but fits 4.6x more context in VRAM. Use turbo3 when you need long context that doesn't fit with q8_0.
 
 ## Which Mode Should I Use?
 
@@ -31,51 +31,36 @@ The tradeoff: ~5% slower at short context, but faster at long context and fits 4
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio | KV Memory |
 |---------|-----------|-------------|-------|-----------|
-| short | 55.42 | 52.68 | 0.951x | 4.6x smaller |
-| 4K | 54.49 | 52.37 | 0.961x | 4.6x smaller |
-| 8K | 52.77 | 49.19 | 0.932x | 4.6x smaller |
-| 16K | 50.31 | 49.89 | **0.992x** | 4.6x smaller |
-| 32K | 45.80 | 48.24 (turbo2) | **1.053x** | 4.6-6.4x smaller |
+| short | 54.17 | 48.95 | 0.904x | 4.6x smaller |
+| 8K | ~42 | 46.04 | ~1.10x | 4.6x smaller |
+| 32K | 44.63 | 35.35 | 0.792x | 4.6x smaller |
+| 64K | OOM risk | 27.23 | **works (24 GB)** | 4.6x smaller |
 
 ### All Turbo Types (Dense, tok/s)
 
-| Type | bpv | Short | 4K | 8K | 16K | 32K |
-|------|-----|------:|---:|---:|----:|----:|
-| q8_0 | 8.5 | 55.42 | 54.49 | 52.77 | 50.31 | 45.80 |
-| turbo2 | 2.5 | 52.74 | 52.43 | 51.17 | 50.07 | **48.24** |
-| turbo3 | 3.5 | 52.68 | 52.37 | 49.19 | 49.89 | **~48** |
-| turbo4 | 4.25 | 49.31 | 48.86 | 47.96 | 47.13 | 45.40 |
-| K=turbo3/V=q8_0 | ~6 | **53.92** | **52.75** | **51.33** | 48.59 | 45.19 |
+| Type | bpv | Short | 8K | 32K |
+|------|-----|------:|---:|----:|
+| q8_0 | 8.5 | 54.17 | ~42 | 44.63 |
+| turbo2 | 2.5 | 50.08 | 49.10 | 39.98 |
+| turbo3 | 3.5 | 48.95 | 46.04 | 35.35 |
+| turbo4 | 4.25 | 44.45 | — | — |
+| K=turbo3/V=q8_0 | ~6 | 51.69 | ~39 | 39.80 |
 
 ### MoE Model: Qwen 3.5 35B-A3B Q4_K_M
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio |
 |---------|-----------|-------------|-------|
-| short | 176 | 164 | 0.933x |
-| 32K | 140 | **142** | **1.015x** |
-| 128K | 89 | **116** | **1.307x** |
-
-### Asymmetric Mode (K=turbo3, V=q8_0)
-
-| Model | Context | q8_0 tok/s | K=turbo3 V=q8_0 | Ratio |
-|-------|---------|-----------|----------------|-------|
-| Dense | short | 55.42 | **53.92** | **0.973x** |
-| Dense | 4K | 54.49 | 52.75 | 0.968x |
-| Dense | 8K | 52.77 | **51.33** | **0.973x** |
-| Dense | 16K | 50.31 | 48.59 | 0.966x |
-| MoE | short | 176 | **176** | **0.998x** |
-| MoE | 32K | 140 | **140** | **1.003x** |
-| MoE | 128K | 89 | **93** | **1.048x** |
+| short | ~137 | 140 | 1.02x |
+| 32K | ~124 | 96 | 0.77x |
+| 128K | 81 | 37 | 0.46x |
 
 ### Quality (PPL, wikitext-2, 8 chunks)
 
 | Config | ctx=512 | ctx=2048 |
 |--------|---------|----------|
 | q8_0 | 6.759 | 5.674 |
-| turbo3 | **6.803 (+0.65%)** | 5.737 (+1.11%) |
-| turbo3 LA-1 | 6.804 (+0.67%) | -- |
-| K=turbo3 V=q8_0 | 6.804 (+0.67%) | **5.650 (-0.42%)** |
-| turbo4 | -- | **5.715 (+0.72%)** |
+| turbo3 | **6.803 (+0.65%)** | **5.688 (+0.25%)** |
+| turbo4 | -- | **5.688 (+0.25%)** |
 | turbo2 | -- | 5.929 (+4.5%) |
 
 ## Comparison With Other Forks
