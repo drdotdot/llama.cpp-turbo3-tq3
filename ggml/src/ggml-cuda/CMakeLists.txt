@@ -5,6 +5,13 @@ find_package(CUDAToolkit)
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
+    # CUDA 13.x has known bugs on SM120 (RTX 5090):
+    # - nvcc -O3 generates incorrect MMQ kernels (segfault)
+    # - cuBLAS is 22% slower than CUDA 12.8
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+        message(WARNING "CUDA ${CUDAToolkit_VERSION} detected. CUDA 13.x causes MMQ segfaults on SM120 (RTX 5090). Use CUDA 12.8.")
+    endif()
+
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         # native == GPUs available at build time
         # 50     == Maxwell, lowest CUDA 12 standard
@@ -149,6 +156,7 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+        message(WARNING "GGML_CUDA_FORCE_CUBLAS=ON — this causes 5-6x perf loss on Blackwell. Use OFF or delete build/ and reconfigure.")
     endif()
 
     if (GGML_CUDA_NO_VMM)
