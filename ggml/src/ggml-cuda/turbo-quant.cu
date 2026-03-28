@@ -667,17 +667,40 @@ static __global__ void kernel_set_rows_turbo4(
             dst_blk->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
     }
 
-    // Rotated-space residual for QJL
+    // Original-space residual for QJL (per paper Algorithm 2):
+    // 1. Inverse-rotate the reconstruction back to original space
+    // 2. Compute residual = normalized_original - recon_original
+    float recon_orig[128];
+    for (int j = 0; j < 128; j++) recon_orig[j] = recon[j];
+
+    // Inverse FWHT: apply signs2, inverse butterfly, apply signs1, normalize
+    for (int i = 0; i < 128; i++) recon_orig[i] *= wht_signs2[i];
+    // Inverse butterfly = same butterfly (FWHT is self-inverse up to scale)
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int jj = i; jj < i + h; jj++) {
+                float a = recon_orig[jj], b = recon_orig[jj + h];
+                recon_orig[jj] = a + b; recon_orig[jj + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128_qjl = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) recon_orig[i] = recon_orig[i] * inv_sqrt_128_qjl * wht_signs1[i];
+
+    // Residual in ORIGINAL space (grp_src * inv_norm was the normalized original)
+    // We saved the original normalized values before rotation — but they were
+    // overwritten by x[]. Recompute from grp_src:
     float residual[128];
     float rnorm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        residual[j] = x[j] - recon[j];
+        float normalized_j = grp_src[j] * inv_norm;
+        residual[j] = normalized_j - recon_orig[j];
         rnorm_sq += residual[j] * residual[j];
     }
     float rnorm = sqrtf(rnorm_sq);
     dst_blk->rnorm = __float2half(rnorm);
 
-    // QJL rotation of residual, then extract sign bits
+    // QJL projection of original-space residual (using QJL-specific FWHT signs)
     for (int i = 0; i < 128; i++) residual[i] *= d_turbo_qjl_signs1[i];
     turbo_fwht_128(residual);
     for (int i = 0; i < 128; i++) residual[i] *= d_turbo_qjl_signs2[i];
