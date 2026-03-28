@@ -95,21 +95,25 @@ Read the decode data flow in `.trash/resume.md` before modifying fattn.cu or tur
 cd /home/erol/ai/turboquant/research/llama-cpp-turboquant
 /home/erol/miniconda3/envs/tq/bin/cmake --build build -j$(nproc)
 
-# PPL gate (run for EVERY code change):
+# ALWAYS use -mmp 0 to disable mmap. Without it, the 21GB model fills the
+# Linux page cache (43GB of 48GB RAM), WSL2 evicts under pressure, and GPU
+# transfers stall randomly — causing wild benchmark variance (±100 tok/s).
 MODEL=/home/erol/ai/turboquant/models/opus-v2-Q6_K.gguf
 WIKI=wikitext-2-raw/wiki.test.raw
-./build/bin/llama-perplexity -m $MODEL -f $WIKI -c 512 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99
-./build/bin/llama-perplexity -m $MODEL -f $WIKI -c 2048 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99
+
+# PPL gate (run for EVERY code change):
+./build/bin/llama-perplexity -m $MODEL -f $WIKI -c 512 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99 -mmp 0
+./build/bin/llama-perplexity -m $MODEL -f $WIKI -c 2048 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99 -mmp 0
 
 # Full decode curve (NOTE: llama-bench uses -d for depth, NOT -c):
 for DEPTH in 0 2048 4096 8192 16384 32768; do
-  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk turbo3 -ctv turbo3 -d $DEPTH -ngl 99 -t 1 -r 3 -p 0 -n 128
-  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk q8_0 -ctv q8_0 -d $DEPTH -ngl 99 -t 1 -r 3 -p 0 -n 128
+  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk turbo3 -ctv turbo3 -d $DEPTH -ngl 99 -t 1 -r 3 -p 0 -n 128 -mmp 0
+  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk q8_0 -ctv q8_0 -d $DEPTH -ngl 99 -t 1 -r 3 -p 0 -n 128 -mmp 0
 done
 
 # Prefill:
 for DEPTH in 0 8192 32768; do
-  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk turbo3 -ctv turbo3 -d $DEPTH -ngl 99 -t 1 -p 512 -n 0 -r 1
+  ./build/bin/llama-bench -m $MODEL -fa 1 -ctk turbo3 -ctv turbo3 -d $DEPTH -ngl 99 -t 1 -p 512 -n 0 -r 1 -mmp 0
 done
 ```
 
@@ -142,6 +146,7 @@ done
 - FlashAttention-3/4 does NOT work on SM120
 - HAS native FP4 E2M1 Tensor Core support via `mma.sync.m16n8k64`
 - CUDA 12.8 only (13.1 segfaults on MMQ kernels)
+- **WSL2**: Always use `-mmp 0` to disable mmap. The 21GB model fills the Linux page cache (43GB/48GB RAM), causing GPU transfer stalls and wild benchmark variance.
 
 ### Key Files
 ```
