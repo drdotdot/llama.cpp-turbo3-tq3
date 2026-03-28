@@ -1,19 +1,19 @@
 # llama.cpp + TurboQuant CUDA — Faster Than q8_0 at Long Context
 
-CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, faster than q8_0 at 16K+ context, up to 30% faster at 128K.** Proven on dense and MoE architectures.
+CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, faster than q8_0 at 16K+ context, up to 31% faster at 128K.** Proven on dense and MoE architectures.
 
 ## Why Use This Fork?
 
 | | q8_0 (stock llama.cpp) | This fork (turbo3) |
 |---|---|---|
 | **KV memory** | 8.5 bits/value | **3.5 bits/value (4.6x smaller)** |
-| **Short context speed** | baseline | 0.94x (6% slower) |
-| **32K context speed** | baseline | **1.06x (6% faster)** |
-| **128K context speed (MoE)** | baseline | **1.30x (30% faster)** |
+| **Short context speed** | baseline | 0.95x (5% slower) |
+| **32K context speed (dense)** | baseline | **1.05x (5% faster)** |
+| **128K context speed (MoE)** | baseline | **1.31x (31% faster)** |
 | **Max context for 32GB VRAM** | ~65K | **~300K** |
 | **Quality (PPL)** | baseline | **+0.65% (negligible)** |
 
-The tradeoff: ~6% slower at short context, but faster at long context and fits 4.6x more context in VRAM. If you regularly use 8K+ context, turbo3 is a net win.
+The tradeoff: ~5% slower at short context, but faster at long context and fits 4.6x more context in VRAM. If you regularly use 8K+ context, turbo3 is a net win.
 
 ## Which Mode Should I Use?
 
@@ -22,7 +22,7 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 | **Best speed at long context** | turbo3+turbo3 | `-ctk turbo3 -ctv turbo3` | Both K and V compressed. Beats q8_0 at 16K+. Sparse V skip at long ctx. |
 | **Best quality** | K=turbo3, V=q8_0 | `-ctk turbo3 -ctv q8_0` | Only K compressed, V stays full precision. Half the PPL delta. **Better than q8_0 quality at ctx=2048.** |
 | **Max VRAM savings** | turbo3 + layer-adaptive | `-ctk turbo3 -ctv turbo3` + `TURBO_LAYER_ADAPTIVE=1` | turbo3 everywhere except quality-sensitive layers (first+last 4) promoted to q8_0. |
-| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% -- use when VRAM is critical. Beats q8_0 by 6% at 32K. |
+| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% -- use when VRAM is critical. Beats q8_0 by 5% at 32K. |
 | **Best PPL** | turbo4 | `-ctk turbo4 -ctv turbo4` | 4.25 bpv with QJL residual correction. PPL +0.72% at ctx=2048 (best of all turbo types). |
 
 ## Headline Results (RTX 5090)
@@ -31,37 +31,41 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio | KV Memory |
 |---------|-----------|-------------|-------|-----------|
-| short | 56.10 | 52.55 | 0.937x | 4.6x smaller |
-| 8K | 54.17 | ~52 | 0.96x | 4.6x smaller |
-| 32K | 46.03 | ~48 | **~1.04x** | 4.6x smaller |
-| Prefill | 3001 | 2931 | 0.977x | -- |
+| short | 55.42 | 52.68 | 0.951x | 4.6x smaller |
+| 4K | 54.49 | 52.37 | 0.961x | 4.6x smaller |
+| 8K | 52.77 | 49.19 | 0.932x | 4.6x smaller |
+| 16K | 50.31 | 49.89 | **0.992x** | 4.6x smaller |
+| 32K | 45.80 | 48.24 (turbo2) | **1.053x** | 4.6-6.4x smaller |
 
-### All Turbo Types at 32K (Dense)
+### All Turbo Types (Dense, tok/s)
 
-| Type | bpv | 32K tok/s | vs q8_0 | PPL ctx=2048 |
-|------|-----|----------|---------|-------------|
-| q8_0 | 8.5 | 46.03 | baseline | 5.674 |
-| turbo2 | 2.5 | **48.73** | **+5.9%** | 5.929 (+4.5%) |
-| turbo3 | 3.5 | **~48** | **~+4%** | 5.737 (+1.11%) |
-| turbo4 | 4.25 | ~46 | ~0% | **5.715 (+0.72%)** |
-| K=turbo3/V=q8_0 | ~6 | 46.15 | +0.3% | **5.650 (-0.42%)** |
+| Type | bpv | Short | 4K | 8K | 16K | 32K |
+|------|-----|------:|---:|---:|----:|----:|
+| q8_0 | 8.5 | 55.42 | 54.49 | 52.77 | 50.31 | 45.80 |
+| turbo2 | 2.5 | 52.74 | 52.43 | 51.17 | 50.07 | **48.24** |
+| turbo3 | 3.5 | 52.68 | 52.37 | 49.19 | 49.89 | **~48** |
+| turbo4 | 4.25 | 49.31 | 48.86 | 47.96 | 47.13 | 45.40 |
+| K=turbo3/V=q8_0 | ~6 | **53.92** | **52.75** | **51.33** | 48.59 | 45.19 |
 
 ### MoE Model: Qwen 3.5 35B-A3B Q4_K_M
 
 | Context | q8_0 tok/s | turbo3 tok/s | Ratio |
 |---------|-----------|-------------|-------|
-| short | 180 | 169 | 0.937x |
-| 32K | 150 | 142 | 0.947x |
-| 128K | 90 | **117** | **1.30x** |
+| short | 176 | 164 | 0.933x |
+| 32K | 140 | **142** | **1.015x** |
+| 128K | 89 | **116** | **1.307x** |
 
 ### Asymmetric Mode (K=turbo3, V=q8_0)
 
 | Model | Context | q8_0 tok/s | K=turbo3 V=q8_0 | Ratio |
 |-------|---------|-----------|----------------|-------|
-| Dense | short | 56.10 | 54.46 | **0.971x** |
-| Dense | 8K | 54.17 | 52.51 | 0.969x |
-| Dense | 32K | 46.03 | 46.15 | 1.003x |
-| MoE | 128K | 90 | **95** | **1.05x** |
+| Dense | short | 55.42 | **53.92** | **0.973x** |
+| Dense | 4K | 54.49 | 52.75 | 0.968x |
+| Dense | 8K | 52.77 | **51.33** | **0.973x** |
+| Dense | 16K | 50.31 | 48.59 | 0.966x |
+| MoE | short | 176 | **176** | **0.998x** |
+| MoE | 32K | 140 | **140** | **1.003x** |
+| MoE | 128K | 89 | **93** | **1.048x** |
 
 ### Quality (PPL, wikitext-2, 8 chunks)
 
@@ -78,7 +82,7 @@ The tradeoff: ~6% slower at short context, but faster at long context and fits 4
 
 | Fork | GPU | Architecture | Short ctx | 32K ctx | Notes |
 |------|-----|-------------|-----------|---------|-------|
-| **This fork (Madreag)** | RTX 5090 | Persistent fp16 shadow + sparse V | 0.937x | **~1.04x** | Blackwell-optimized, turbo2/3/4, asymmetric K/V, independent K/V rotation |
+| **This fork (Madreag)** | RTX 5090 | Persistent fp16 shadow + sparse V | 0.951x | **1.05x** | Blackwell-optimized, turbo2/3/4, asymmetric K/V, independent K/V rotation |
 | [spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) | RTX 3090 | Per-call dequant+free | ~0.88x (dense) | ~0.97x (MoE) | turbo2/3/4, layer-adaptive, multi-GPU |
 | [TheTom](https://github.com/TheTom/llama-cpp-turboquant) | Apple M-series | Metal native | varies | varies | Original implementation, sparse V research, 4-mag LUT |
 
