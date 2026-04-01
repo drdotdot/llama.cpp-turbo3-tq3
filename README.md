@@ -1,192 +1,124 @@
-# llama.cpp + TurboQuant CUDA — Faster Than q8_0 at Long Context
+# llama.cpp + Turbo3/TQ3 — TurboQuant for BOTH Weights and KV Cache
 
-CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for NVIDIA GPUs. **4.6x less KV memory, enabling 128K+ context on a single RTX 5090.** No fp16 shadow buffer — reads packed turbo blocks directly.
+A standalone `llama.cpp` fork focused on one key capability:
 
-## Why Use This Fork?
+> **TurboQuant for both model weights and KV cache in the same runtime.**
 
-| | q8_0 (stock llama.cpp) | This fork (turbo3) |
-|---|---|---|
-| **KV memory** | 8.5 bits/value | **3.5 bits/value (4.6x smaller)** |
-| **Short context speed** | baseline | 0.90x (10% slower) |
-| **32K context speed** | baseline | 0.79x (compute-bound on centroid extraction) |
-| **128K context (dense 27B)** | OOM on 32GB | **Works at 25 GB VRAM** |
-| **Max context for 32GB VRAM** | ~65K | **~300K** |
-| **Quality (PPL)** | baseline | **+0.65% (negligible)** |
+This repo combines:
+- **TQ3/TQ3_1S weight loading** for TurboQuant-compressed GGUF models
+- **Turbo3 KV cache compression** for long-context inference
+- **CUDA execution path** for actually running both together on GPU
 
-The tradeoff: ~10-20% slower decode (centroid extraction overhead), but fits 4.6x more context in VRAM. Use turbo3 when you need long context that doesn't fit with q8_0.
+That means you can run a model like **Qwen3.5-27B-TQ3_1S.gguf** *and* keep the KV cache compressed with `-ctk turbo3 -ctv turbo3` in the same server process.
 
-## Which Mode Should I Use?
+## Why This Fork Exists
 
-| Your priority | Mode | Command | What it does |
-|---|---|---|---|
-| **Best speed at long context** | turbo3+turbo3 | `-ctk turbo3 -ctv turbo3` | Both K and V compressed. Beats q8_0 at 16K+. Sparse V skip at long ctx. |
-| **Best quality** | K=turbo3, V=q8_0 | `-ctk turbo3 -ctv q8_0` | Only K compressed, V stays full precision. Half the PPL delta. **Better than q8_0 quality at ctx=2048.** |
-| **Max VRAM savings** | turbo3 + layer-adaptive | `-ctk turbo3 -ctv turbo3` + `TURBO_LAYER_ADAPTIVE=1` | turbo3 everywhere except quality-sensitive layers (first+last 4) promoted to q8_0. |
-| **Extreme VRAM savings** | turbo2 | `-ctk turbo2 -ctv turbo2` | 2.5 bpv, 6.4x compression. PPL +4.5% -- use when VRAM is critical. Beats q8_0 by 5% at 32K. |
-| **Best PPL** | turbo4 | `-ctk turbo4 -ctv turbo4` | 4.25 bpv with QJL residual correction. PPL +0.72% at ctx=2048 (best of all turbo types). |
+Most TurboQuant work to date has been split across separate branches/forks:
+- one path for **TurboQuant-compressed weights**
+- another path for **TurboQuant-compressed KV cache**
 
-## Headline Results (RTX 5090)
+This repo is about unifying those two pieces into one practical fork.
 
-### Dense Model: Qwen 3.5 27B Q6_K
+## The Important Point
 
-| Context | q8_0 tok/s | turbo3 tok/s | Ratio | KV Memory |
-|---------|-----------|-------------|-------|-----------|
-| short | 54.17 | 48.95 | 0.904x | 4.6x smaller |
-| 8K | ~42 | 46.04 | ~1.10x | 4.6x smaller |
-| 32K | 44.63 | 35.35 | 0.792x | 4.6x smaller |
-| 64K | OOM risk | 27.23 | **works (24 GB)** | 4.6x smaller |
+**This is not just TurboQuant weights.**
+**This is not just TurboQuant KV cache.**
 
-### All Turbo Types (Dense, tok/s)
+**This repo is TurboQuant for BOTH weights and KV cache.**
 
-| Type | bpv | Short | 8K | 32K |
-|------|-----|------:|---:|----:|
-| q8_0 | 8.5 | 54.17 | ~42 | 44.63 |
-| turbo2 | 2.5 | 50.08 | 49.10 | 39.98 |
-| turbo3 | 3.5 | 48.95 | 46.04 | 35.35 |
-| turbo4 | 4.25 | 44.45 | — | — |
-| K=turbo3/V=q8_0 | ~6 | 51.69 | ~39 | 39.80 |
+That is the headline and the reason to use it.
 
-### MoE Model: Qwen 3.5 35B-A3B Q4_K_M
+## Current Verified Capability
 
-| Context | q8_0 tok/s | turbo3 tok/s | Ratio |
-|---------|-----------|-------------|-------|
-| short | ~137 | 140 | 1.02x |
-| 32K | ~124 | 96 | 0.77x |
-| 128K | 81 | 37 | 0.46x |
+Verified on the live Hermes/Qwen setup:
+- **Model format loaded:** `TQ3_1S`
+- **Weight tensors loaded:** TQ3_1S tensors recognized successfully
+- **KV cache mode:** `turbo3` for both K and V
+- **CUDA offload:** full GPU layer offload working on tested model
+- **Long context:** server handled very large prompts while keeping TurboQuant KV active
 
-### Quality (PPL, wikitext-2, 8 chunks)
+Representative verified startup characteristics from the live run:
+- file type: **TQ3_1S (turbo two-scale, ~4 bpw)**
+- model size: **~12.91 GiB**
+- layers offloaded: **65/65 to GPU**
+- KV cache allocation: **turbo3 K + turbo3 V**
+- context: **98,304 tokens**
 
-| Config | ctx=512 | ctx=2048 |
-|--------|---------|----------|
-| q8_0 | 6.759 | 5.674 |
-| turbo3 | **6.803 (+0.65%)** | **5.688 (+0.25%)** |
-| turbo4 | -- | **5.688 (+0.25%)** |
-| turbo2 | -- | 5.929 (+4.5%) |
+## What You Get
 
-## Comparison With Other Forks
+### 1) TurboQuant weights
+Support for loading TurboQuant-compressed GGUF weights, especially:
+- `TQ3_1S`
+- related TQ3-family paths being integrated in this codebase
 
-| Fork | GPU | Architecture | Short ctx | 32K ctx | Notes |
-|------|-----|-------------|-----------|---------|-------|
-| **This fork (Madreag)** | RTX 5090 | Persistent fp16 shadow + sparse V | 0.951x | **1.05x** | Blackwell-optimized, turbo2/3/4, asymmetric K/V, independent K/V rotation |
-| [spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) | RTX 3090 | Per-call dequant+free | ~0.88x (dense) | ~0.97x (MoE) | turbo2/3/4, layer-adaptive, multi-GPU |
-| [TheTom](https://github.com/TheTom/llama-cpp-turboquant) | Apple M-series | Metal native | varies | varies | Original implementation, sparse V research, 4-mag LUT |
+### 2) TurboQuant KV cache
+Support for TurboQuant KV cache compression through llama.cpp cache flags:
+- `-ctk turbo3`
+- `-ctv turbo3`
 
-**Which fork for your GPU?**
-- **RTX 5090 / Blackwell**: This fork
-- **RTX 3090 / 4090 / Ampere / Ada**: [spiritbuun's fork](https://github.com/spiritbuun/llama-cpp-turboquant-cuda)
-- **Apple Silicon**: [TheTom's fork](https://github.com/TheTom/llama-cpp-turboquant)
-
-## What Makes This Fork Unique
-
-- **Persistent fp16 shadow cache** -- KV data dequanted once, cached across tokens. Only new positions (1 per token) need dequanting. Zero per-token overhead for existing cache entries.
-- **Sparse V dequantization** -- Skip V dequant+accumulate for positions with attention weight < 1e-4. Eliminates 90%+ of V-path work at long context. Based on [TheTom's research](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/sparse-v-dequant.md).
-- **Independent K/V rotation** -- K and V use separate FWHT sign arrays, decorrelating quantization errors. Free PPL improvement: +1.32% -> +0.65%.
-- **Asymmetric K/V types** -- Use turbo3 K + q8_0 V for best quality (half the PPL delta, better than q8_0 at long context).
-- **turbo2/turbo3/turbo4** -- Three compression levels: 2.5 / 3.5 / 4.25 bpv. Choose your compression vs quality tradeoff.
-- **Layer-adaptive KV cache** -- 8 modes for per-layer K/V type promotion (symmetric and asymmetric).
-- **Blackwell-optimized** -- 16-byte struct padding for GDDR7 32-byte sector coalescing, SM120 tuning.
-- **Prefill dequant+MMA** -- Tensor Core acceleration for prompt processing via bulk fp16 dequant.
+### 3) The combination
+The main value of this repo is that the two features work together:
+- **TurboQuant model weights**
+- **TurboQuant KV cache**
+- **same runtime / same server / same CUDA path**
 
 ## Quick Start
 
+### Build
+
 ```bash
-# Build (adjust CUDA_ARCHITECTURES for your GPU: 75=Turing, 80=Ampere, 89=Ada, 120=Blackwell)
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
 cmake --build build -j$(nproc)
-
-# Recommended: turbo3 KV cache (Flash Attention auto-enabled)
-./build/bin/llama-cli -hf your-model-GGUF -ctk turbo3 -ctv turbo3 -ngl 99
-
-# Best quality: turbo3 K + q8_0 V
-./build/bin/llama-cli -hf your-model-GGUF -ctk turbo3 -ctv q8_0 -ngl 99
-
-# turbo4: best PPL (4.25 bpv with QJL residual)
-./build/bin/llama-cli -hf your-model-GGUF -ctk turbo4 -ctv turbo4 -ngl 99
-
-# turbo2: maximum compression (2.5 bpv, 6.4x)
-./build/bin/llama-cli -hf your-model-GGUF -ctk turbo2 -ctv turbo2 -ngl 99
-
-# Server mode
-./build/bin/llama-server -hf your-model-GGUF -ctk turbo3 -ctv turbo3 -ngl 99 --port 8080
-
-# Layer-adaptive (best PPL with turbo3)
-TURBO_LAYER_ADAPTIVE=1 ./build/bin/llama-cli -hf your-model-GGUF -ctk turbo3 -ctv turbo3 -ngl 99
 ```
 
-## Hardware
+Adjust `CMAKE_CUDA_ARCHITECTURES` for your GPU.
 
-- **Tested**: RTX 5090 32GB, CUDA 12.8, SM120 (Blackwell)
-- **Should work**: SM75+ (Turing and newer), but only tested on SM120. Use [spiritbuun's fork](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) for confirmed RTX 3090/4090 support
-- **Do NOT use CUDA 13.x** -- causes MMQ segfaults on SM120. Stick with CUDA 12.8.
+### Run a TQ3 model with Turbo3 KV cache
 
-Flash Attention is **required** for turbo types (auto-enabled when turbo K/V is detected).
-
-## Configuration
-
-| Environment Variable | Effect | Default |
-|---------------------|--------|---------|
-| `TURBO_LAYER_ADAPTIVE=N` | Per-layer KV type (see below) | 0 (uniform turbo) |
-| `GGML_TURBO_DECODE_NATIVE=1` | Disable fp16 shadow, use native turbo3 vec kernel (slower, for debugging) | disabled |
-
-**Layer-adaptive modes** (`TURBO_LAYER_ADAPTIVE`):
-
-| Mode | Strategy | PPL impact |
-|------|----------|------------|
-| `0` | Uniform turbo (default) | +0.65% |
-| `1` | q8_0 for first 4 + last 4 layers (K+V) | **+0.67%** |
-| `2` | q8_0 for last 8 layers (K+V) | ~+0.9% |
-| `3` | q8_0 for last 4 layers (K+V) | ~+1.0% |
-| `4` | q8_0 for first 4 layers (K+V) | ~+1.0% |
-| `5` | q8_0 for first 2 + last 2 layers (K+V) | ~+0.9% |
-| `6` | **V-only** q8_0 for last 8 layers | +0.86% (saves more VRAM than mode 2) |
-| `7` | **K-only** q8_0 for last 8 layers | experimental |
-| `8` | **V-only** q8_0 for first 2 + last 2 | experimental |
-
-## How It Works
-
-[TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) compresses KV cache vectors to 3.5 bits/value:
-
-1. **Normalize** -- compute L2 norm of 128-element groups
-2. **Rotate** -- Fast Walsh-Hadamard Transform with independent K/V sign arrays (Gaussianizes the distribution)
-3. **Quantize** -- nearest of 8 Lloyd-Max centroids (3-bit index)
-4. **Pack** -- 2-bit qs[] + 1-bit signs[] arrays + fp16 norm per block
-5. **Norm correction** -- store `raw_norm / ||reconstruction||` instead of raw norm for exact L2 norm recovery
-
-Block format: 16 bytes per 32 values (padded from 14 for GDDR7 coalescing).
-
-### Decode Architecture
-
-```
-Token arrives -> SET_ROWS quantizes K/V to turbo3 in KV cache (FWHT + centroid quantize)
-              -> Shadow cache: incremental dequant of 1 new position to fp16
-                               (positions 0..N-1 already cached from previous tokens)
-
-Flash Attention -> K path: fp16 dot product from shadow (hardware half2 ops)
-               -> V path: sparse skip for attention weight < 1e-4 (90%+ skipped at long ctx)
-
-Output -> graph-level inverse FWHT rotation on attention output
+```bash
+./build/bin/llama-server \
+  -m /path/to/Qwen3.5-27B-TQ3_1S.gguf \
+  -ngl 99 \
+  -ctk turbo3 \
+  -ctv turbo3 \
+  -c 98304
 ```
 
-### Why turbo3 beats q8_0 at long context
+This is the core configuration this repo exists to enable.
 
-1. **4.6x less KV bandwidth** -- turbo3 = 16 bytes/32 values, q8_0 = 34 bytes/32 values. At 32K+, decode is memory-bandwidth-bound.
-2. **Sparse V skip** -- 90%+ of V positions have negligible attention weight. Skipping them removes both bandwidth AND quantization noise.
-3. **L2 cache efficiency** -- More turbo3 KV fits in the RTX 5090's 98 MB L2 cache at the same context length.
+## Repo Focus
+
+This is a practical engineering fork, not a paper mirror.
+
+Primary focus:
+- make **TQ3 weights + turbo3 KV** work together cleanly
+- keep the CUDA path real and usable
+- document what is verified versus what is still in progress
+
+## Status
+
+See:
+- [`docs/VERIFICATION.md`](docs/VERIFICATION.md) — what has been verified live
+- [`docs/REPO_SCOPE.md`](docs/REPO_SCOPE.md) — what this repo is for
+- [`PLAN.md`](PLAN.md) — local implementation goal and source references
+
+## Relationship to Other Repos
+
+Reference repo for the TQ3 side:
+- <https://github.com/turbo-tan/llama.cpp-tq3>
+
+This repo is **our own standalone repo**, not a fork of that repository.
+It exists to carry the combined Turbo3 + TQ3 work as its own project.
 
 ## Credits
 
-- **[TheTom](https://github.com/TheTom/llama-cpp-turboquant)** -- Original Metal implementation, sparse V dequant research, norm correction innovation, diagnostic scripts
-- **[spiritbuun](https://github.com/spiritbuun/llama-cpp-turboquant-cuda)** -- CUDA reference (RTX 3090), norm correction, layer-adaptive, prefill MMA, turbo2/turbo4 port
-- **[Google Research](https://arxiv.org/abs/2504.19874)** -- TurboQuant algorithm (ICLR 2026)
-- **[Madreag](https://github.com/Madreag)** -- This fork: RTX 5090 port, persistent shadow cache, sparse V CUDA, asymmetric K/V, independent K/V rotation, Blackwell optimization
+Core ideas and prior implementation work come from the broader TurboQuant community, including:
+- TurboQuant / TQ research and implementations
+- llama.cpp-based TurboQuant forks
+- CUDA and KV cache compression work from prior branches
 
-## Related Projects
-
-- [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- Documentation, benchmarks, diagnostic scripts
-- [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) -- CUDA port for RTX 3090
-- [0xSero/turboquant](https://github.com/0xSero/turboquant) -- Python/Triton implementation for vLLM
-- [ggml-org/llama.cpp Discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969) -- Main TurboQuant community discussion
+This repo’s specific goal is the **combined weights + KV integration path**.
 
 ## License
 
-MIT (matching upstream llama.cpp)
+MIT, matching upstream llama.cpp unless specific files note otherwise.

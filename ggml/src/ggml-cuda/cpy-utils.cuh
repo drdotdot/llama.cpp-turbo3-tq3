@@ -211,57 +211,67 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// TurboQuant 3-bit: norm + nearest centroid packing
-static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ x, block_turbo3_0 * __restrict__ y) {
-    // 3-bit centroids and midpoints (same as in turbo-quant.cu)
-    const float centroids[8] = {
-        -0.190685f, -0.117832f, -0.065717f, -0.021460f,
-         0.021460f,  0.065717f,  0.117832f,  0.190685f
-    };
-    const float midpoints[7] = {
-        -0.154259f, -0.091775f, -0.043589f, 0.0f,
-         0.043589f,  0.091775f,  0.154259f
-    };
+// TurboQuant TQ3_0: WHT rotation + 3-bit Lloyd-Max codebook (block-32)
+__constant__ static const float TQ3_0_CENTROIDS_CUDA[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+     0.230106f,  0.725222f,  1.277503f,  1.988943f
+};
+__constant__ static const float TQ3_0_BOUNDARIES_CUDA[7] = {
+    -1.644041f, -1.015870f, -0.493924f, -0.008701f,
+     0.477664f,  1.001362f,  1.633223f
+};
+__constant__ static const float TQ3_0_SIGNS_CUDA[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+};
 
-    // Compute L2 norm
-    float norm_sq = 0.0f;
-    for (int j = 0; j < QK_TURBO3; j++) {
-        norm_sq += x[j] * x[j];
-    }
-    float norm = sqrtf(norm_sq);
-    float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+static __device__ void quantize_f32_tq3_0_block(const float * __restrict__ x, block_tq3_0 * __restrict__ y) {
+    float buf[32];
 
-    y->norm = __float2half(norm);
-    memset(y->qs,    0, QK_TURBO3 / 4);
-    memset(y->signs, 0, QK_TURBO3 / 8);
+    // 1. RMS scale
+    float sum_sq = 0.0f;
+    for (int i = 0; i < 32; i++) sum_sq += x[i] * x[i];
+    float rms = sqrtf(sum_sq / 32.0f);
+    if (rms < 1e-10f) rms = 1.0f;
+    y->d = __float2half(rms);
+    float inv_rms = 1.0f / rms;
 
-    for (int j = 0; j < QK_TURBO3; j++) {
-        float val = x[j] * inv_norm;
+    // 2. Normalize + sign flips
+    for (int i = 0; i < 32; i++) buf[i] = x[i] * inv_rms * TQ3_0_SIGNS_CUDA[i];
 
-        // Nearest centroid via midpoint comparisons
-        uint8_t idx = 0;
-        idx += (val >= midpoints[0]);
-        idx += (val >= midpoints[1]);
-        idx += (val >= midpoints[2]);
-        idx += (val >= midpoints[3]);
-        idx += (val >= midpoints[4]);
-        idx += (val >= midpoints[5]);
-        idx += (val >= midpoints[6]);
-
-        // Pack lower 2 bits into qs
-        uint8_t low2 = idx & 0x3;
-        y->qs[j >> 2] |= (low2 << ((j & 3) << 1));
-
-        // Pack upper 1 bit into signs
-        uint8_t hi1 = (idx >> 2) & 0x1;
-        if (hi1) {
-            y->signs[j >> 3] |= (1u << (j & 7));
+    // 3. WHT butterfly (5 stages)
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j], b = buf[j + step];
+                buf[j] = a + b; buf[j + step] = a - b;
+            }
         }
     }
-}
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) buf[i] *= norm;
 
-static __device__ void cpy_blck_f32_turbo3_0(const char * cxi, char * cdsti) {
-    quantize_f32_turbo3_0_block((const float *)cxi, (block_turbo3_0 *)cdsti);
+    // 4. Quantize to nearest centroid
+    uint8_t indices[32];
+    for (int i = 0; i < 32; i++) {
+        float v = buf[i];
+        uint8_t idx = 0;
+        for (int b = 0; b < 7; b++) {
+            if (v > TQ3_0_BOUNDARIES_CUDA[b]) idx = b + 1;
+        }
+        indices[i] = idx;
+    }
+
+    // 5. Pack 3-bit indices (8 indices -> 3 bytes)
+    for (int g = 0; g < 4; g++) {
+        const uint8_t * idx = indices + g * 8;
+        uint8_t * qp = y->qs + g * 3;
+        qp[0] = (idx[0])      | (idx[1] << 3) | (idx[2] << 6);
+        qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+        qp[2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+    }
 }
 
 template<typename src_t, typename dst_t>

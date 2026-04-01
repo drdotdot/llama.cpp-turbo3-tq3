@@ -58,10 +58,14 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
-#include "ggml-cuda/turbo-quant.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-quants.h"
+#include "ggml-cuda/tq3-native.cuh"
+#include "ggml-cuda/turbo-quant.cuh"
+void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#include "ggml-cuda/tq3-prefill.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -81,6 +85,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <unordered_set>
@@ -116,6 +121,78 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+static bool ggml_cuda_tq3_native_prefill_debug_enabled() {
+    static bool enabled = getenv("GGML_CUDA_TQ3_NATIVE_PREFILL") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_native_prefill_debug(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1) {
+
+    if (!ggml_cuda_tq3_native_prefill_debug_enabled()) {
+        return;
+    }
+    if (src0->type != GGML_TYPE_TQ3_0 || src1->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    block_tq3_0 host_blk;
+    block_q8_0 host_q8;
+    float host_act[QK_TQ3_0];
+    float host_deq[QK_TQ3_0];
+    const block_tq3_0 * device_blk = (const block_tq3_0 *) src0->data;
+    const float * device_act = (const float *) src1->data;
+
+    CUDA_CHECK(cudaMemcpyAsync(&host_blk, device_blk, sizeof(host_blk), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(host_act, device_act, sizeof(host_act), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    quantize_row_q8_0_ref(host_act, &host_q8, QK_TQ3_0);
+    dequantize_row_tq3_0(&host_blk, host_deq, QK_TQ3_0);
+
+    float host_ref = 0.0f;
+    for (int i = 0; i < QK_TQ3_0; ++i) {
+        host_ref += host_deq[i] * host_act[i];
+    }
+
+    block_q8_0 * d_q8 = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_q8, sizeof(block_q8_0)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(d_q8, &host_q8, sizeof(host_q8), cudaMemcpyHostToDevice, ctx.stream()));
+
+    constexpr int warmup = 4;
+    constexpr int niters = 16;
+    for (int i = 0; i < warmup; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
+    for (int i = 0; i < niters; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, ctx.stream()));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float native_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&native_ms, start, stop));
+
+    float native_sum = 0.0f;
+    CUDA_CHECK(cudaMemcpyAsync(&native_sum, d_out, sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    GGML_LOG_INFO("TQ3 native prefill debug sample: native=%f ref=%f diff=%e avg %.3f us/launch",
+        native_sum, host_ref, fabsf(native_sum - host_ref), 1000.0f * native_ms / niters);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_q8));
+    CUDA_CHECK(cudaFree(d_out));
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -1298,9 +1375,41 @@ static void ggml_cuda_op_mul_mat_cublas(
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 
-    const bool use_fp16 = (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT;
+    const bool use_fp16 =
+        src0->type != GGML_TYPE_NVFP4 &&
+        (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
+        ggml_is_contiguous(src0) &&
+        row_diff == src0->ne[1] &&
+        dst->op_params[0] == GGML_PREC_DEFAULT
+        && src0->type != GGML_TYPE_TQ3_0
+        && src0->type != GGML_TYPE_TQ3_1S;
 
-    if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    if (src0->type == GGML_TYPE_TQ3_0 || src0->type == GGML_TYPE_TQ3_1S) {
+        ggml_cuda_pool_alloc<float> src0_as_f32(ctx.pool(id), row_diff*ne00);
+        const to_fp32_cuda_t to_fp32_src0 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32_src0 != nullptr);
+        to_fp32_src0(src0_dd_i, src0_as_f32.get(), row_diff*ne00, stream);
+
+        const float * src1_ptr = src1_ddf_i;
+        ggml_cuda_pool_alloc<float> src1_as_f32(ctx.pool(id));
+        if (src1->type != GGML_TYPE_F32) {
+            const to_fp32_cuda_t to_fp32_src1 = ggml_get_to_fp32_cuda(src1->type);
+            GGML_ASSERT(to_fp32_src1 != nullptr);
+            src1_as_f32.alloc(src1_ncols*ne10);
+            to_fp32_src1(src1_ddf_i, src1_as_f32.get(), src1_ncols*ne10, stream);
+            src1_ptr = src1_as_f32.get();
+        }
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        CUBLAS_CHECK(
+            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                    row_diff, src1_ncols, ne10,
+                    &alpha, src0_as_f32.get(), ne00,
+                            src1_ptr,          ne10,
+                    &beta,  dst_dd_i,         ldc));
+    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
@@ -1682,7 +1791,7 @@ static void ggml_cuda_op_mul_mat(
         CUDA_CHECK(cudaEventRecord(src0_extra->events[ctx.device][0], ctx.stream()));
     }
 
-    const int64_t src1_col_stride = split && used_devices > 1 ? MUL_MAT_SRC1_COL_STRIDE : ne11;
+    int64_t src1_col_stride = split && used_devices > 1 ? MUL_MAT_SRC1_COL_STRIDE : ne11;
     for (int64_t src1_col_0 = 0; src1_col_0 < ne11; src1_col_0 += src1_col_stride) {
         const int64_t is = split ? (src1_col_0/src1_col_stride) % GGML_CUDA_MAX_STREAMS : 0;
         const int64_t src1_ncols = src1_col_0 + src1_col_stride > ne11 ? ne11 - src1_col_0 : src1_col_stride;
@@ -2207,8 +2316,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    const bool is_turbo = (src0->type == GGML_TYPE_TURBO2_0 || src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0);
+    const bool tq3_vec_prefill_ok = (src0->type != GGML_TYPE_TQ3_0 && src0->type != GGML_TYPE_TQ3_1S) || src1->ne[1] == 1;
+    const bool use_mul_mat_vec_q = tq3_vec_prefill_ok && !is_turbo
+        && ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear);
+    const bool use_mul_mat_vec_q_direct = use_mul_mat_vec_q
+        && (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0))
+        && (src0->type != GGML_TYPE_TQ3_1S || ggml_is_contiguous(src0));
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2250,11 +2364,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     const bool is_turbo = (src0->type == GGML_TYPE_TURBO2_0 || src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0);
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_turbo
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    const bool tq3_vec_prefill_ok = (src0->type != GGML_TYPE_TQ3_0 && src0->type != GGML_TYPE_TQ3_1S) || src1->ne[1] == 1;
+    const bool use_mul_mat_vec_q = tq3_vec_prefill_ok && !is_turbo
+        && ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear);
+    const bool use_mul_mat_vec_q_direct = use_mul_mat_vec_q
+        && (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0))
+        && (src0->type != GGML_TYPE_TQ3_1S || ggml_is_contiguous(src0));
+    const bool tq3_mmq_ok = (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0))
+        && (src0->type != GGML_TYPE_TQ3_1S || ggml_is_contiguous(src0));
+    const bool tq3_1s_mmq_ok = src0->type != GGML_TYPE_TQ3_1S;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_turbo
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && tq3_mmq_ok && tq3_1s_mmq_ok;
+
 
     bool any_gpus_with_slow_fp16 = false;
 
@@ -2283,6 +2404,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
+    if (use_mul_mat_q && src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cuda_native_prefill_debug(ctx, src0, src1);
+    }
+
     // debug helpers
     //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
@@ -2303,7 +2428,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-    } else if (!split && use_mul_mat_vec_q) {
+    } else if (!split && use_mul_mat_vec_q_direct) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
@@ -2340,7 +2465,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                if (ne2 <= MMVQ_MMID_MAX_BATCH_SIZE) {
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2796,6 +2922,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
@@ -2807,9 +2936,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
-            break;
-        case GGML_OP_TURBO_WHT:
-            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
@@ -2946,14 +3072,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-        if (node->op == GGML_OP_MUL_MAT_ID && (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > MMVQ_MMID_MAX_BATCH_SIZE)) {
-            // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-            // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-            // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-            use_cuda_graph = false;
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                use_cuda_graph = false;
 #ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+            }
         }
 
         if (!use_cuda_graph) {
@@ -4786,6 +4916,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+#ifdef FP8_AVAILABLE
+                    case GGML_TYPE_NVFP4:
+#endif // FP8_AVAILABLE
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -4805,6 +4938,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
                         return false;
@@ -4827,6 +4962,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TQ3_0:
+                    case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
                         return false;
@@ -4841,7 +4978,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                       op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) &&
+                       op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
+                       op->type == GGML_TYPE_TQ3_0) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5047,6 +5185,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5056,7 +5196,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
-        case GGML_OP_TURBO_WHT:
             return true;
 
         default:
