@@ -57,6 +57,11 @@ The more exact version is:
 - **weights:** TQ3 / TQ3_1S model-weight formats
 - **cache:** Turbo3 compression for K/V cache
 
+Under the hood, those names point to actual mathematical ideas rather than just branding:
+
+- **TQ3 / TQ3_1S weights**: built around **Walsh-Hadamard rotation** plus learned / codebook-style low-bit quantization paths (the codebase also labels TQ3 as using a **Lloyd-Max codebook** path)
+- **Turbo3 KV cache**: built around **PolarQuant-style low-bit KV compression** with a **QJL (Johnson-Lindenstrauss) residual bit** in the `turbo3` path
+
 So the headline can be loud.
 The body should stay precise.
 That is what this repo is trying to do.
