@@ -28,13 +28,12 @@ On the **weights** side, this repo includes support for **TQ3 / TQ3_1S GGUF tens
 
 On the **cache** side, this repo includes support for **Turbo3 compression for both K and V cache**.
 
-Under the hood, those names map to actual quantization ideas rather than just repo slang:
+For readers who want the technical meaning of those labels:
 
-- **TQ3 / TQ3_1S weights**: Walsh-Hadamard rotation, centroid/codebook quantization, and dual-scale block structure
-- **Turbo3 KV cache**: PolarQuant-style low-bit KV compression with a QJL-style residual bit path
+- **TQ3 / TQ3_1S weights** use Walsh-Hadamard rotation, centroid/codebook quantization, and a dual-scale block structure
+- **Turbo3 KV cache** uses a PolarQuant-style low-bit KV compression path with a QJL-style residual bit
 
-So the short version is catchy.
-The precise version is still real.
+In other words, the names point to specific compression methods, not just marketing labels.
 
 ## Verified result
 
